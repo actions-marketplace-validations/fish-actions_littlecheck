@@ -1,23 +1,24 @@
 #!/usr/bin/env python
 
-""" Command line test driver. """
+"""Command line test driver."""
 
 from __future__ import unicode_literals
 from __future__ import print_function
-
 import argparse
+import asyncio
 import datetime
+from difflib import SequenceMatcher
 import io
 import re
 import shlex
-import subprocess
 import sys
+import unicodedata
 
 try:
     from itertools import zip_longest
 except ImportError:
     from itertools import izip_longest as zip_longest
-from difflib import SequenceMatcher
+
 
 # Directives can occur at the beginning of a line, or anywhere in a line that does not start with #.
 COMMENT_RE = r"^(?:[^#].*)?#\s*"
@@ -36,6 +37,7 @@ VARIABLE_OVERRIDE_RE = re.compile(r"\w+=.*")
 
 SKIP = object()
 
+
 def find_command(program):
     import os
 
@@ -49,6 +51,7 @@ def find_command(program):
 
     return None
 
+
 class Config(object):
     def __init__(self):
         # Whether to have verbose output.
@@ -59,7 +62,7 @@ class Config(object):
         self.progress = False
 
     def colors(self):
-        """ Return a dictionary mapping color names to ANSI escapes """
+        """Return a dictionary mapping color names to ANSI escapes"""
 
         def ansic(n):
             return "\033[%dm" % n if self.colorize else ""
@@ -89,9 +92,6 @@ class Config(object):
 
 def output(*args):
     print("".join(args) + "\n")
-
-
-import unicodedata
 
 
 def esc(m):
@@ -130,7 +130,7 @@ class CheckerError(Exception):
 
 
 class Line(object):
-    """ A line that remembers where it came from. """
+    """A line that remembers where it came from."""
 
     def __init__(self, text, number, file):
         self.text = text
@@ -158,7 +158,7 @@ class Line(object):
         raise NotImplementedError
 
     def subline(self, text):
-        """ Return a substring of our line with the given text, preserving number and file. """
+        """Return a substring of our line with the given text, preserving number and file."""
         return Line(text, self.number, self.file)
 
     @staticmethod
@@ -230,7 +230,7 @@ class TestFailure(object):
         if self.signal:
             fmtstrs += [
                 "  Process was killed by signal {BOLD}" + self.signal + "{RESET}",
-                ""
+                "",
             ]
         if self.line and self.check:
             fmtstrs += [
@@ -351,7 +351,7 @@ class TestFailure(object):
         return "\n".join(fmtstrs).format(**fields)
 
     def print_message(self):
-        """ Print our message to stdout. """
+        """Print our message to stdout."""
         print(self.message())
 
 
@@ -380,28 +380,28 @@ def perform_substitution(input_str, subs):
     return re.sub(r"%(%|[a-zA-Z0-9_-]+)", subber, input_str)
 
 
-def runproc(cmd):
-    """ Wrapper around subprocess.Popen to save typing """
-    PIPE = subprocess.PIPE
-    proc = subprocess.Popen(
-        cmd,
-        stdin=PIPE,
-        stdout=PIPE,
-        stderr=PIPE,
-        shell=True,
-        close_fds=True,  # For Python 2.6 as shipped on RHEL 6
+def runproc(cmd, env=None):
+    """Wrapper around subprocess.Popen to save typing"""
+    return asyncio.run(runproc_async(cmd, env=env))
+
+
+async def runproc_async(cmd, env=None):
+    """Wrapper around subprocess.Popen to save typing"""
+    PIPE = asyncio.subprocess.PIPE
+    return await asyncio.create_subprocess_shell(
+        cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env
     )
-    return proc
 
 
 class TestRun(object):
-    def __init__(self, name, runcmd, checker, subs, config):
+    def __init__(self, name, runcmd, checker, subs, config, env=None):
         self.name = name
         self.runcmd = runcmd
         self.subbed_command = perform_substitution(runcmd.args, subs)
         self.checker = checker
         self.subs = subs
         self.config = config
+        self.env = env
 
     def check(self, lines, checks):
         # Reverse our lines and checks so we can pop off the end.
@@ -446,7 +446,7 @@ class TestRun(object):
         # SCREENFULS of text.
         # So we truncate the check list.
         if len(usedchecks) > len(usedlines):
-            usedchecks = usedchecks[:len(usedlines) + 5]
+            usedchecks = usedchecks[: len(usedlines) + 5]
 
         # Do a SequenceMatch! This gives us a diff-like thing.
         diff = SequenceMatcher(a=usedlines, b=usedchecks, autojunk=False)
@@ -474,24 +474,37 @@ class TestRun(object):
             return None
 
     def run(self):
-        """ Run the command. Return a TestFailure, or None. """
+        """Run the command. Return a TestFailure, or None."""
+        return asyncio.run(self.run_async())
+
+    async def run_async(self):
+        """Run the command. Return a TestFailure, or None."""
 
         def split_by_newlines(s):
             """Decode a string and split it by newlines only,
             retaining the newlines.
             """
-            return [s + "\n" for s in s.decode("utf-8", errors="backslashreplace").split("\n")]
+            return [
+                s + "\n"
+                for s in s.decode("utf-8", errors="backslashreplace").split("\n")
+            ]
 
         if self.config.verbose:
             print(self.subbed_command)
-        proc = runproc(self.subbed_command)
-        stdout, stderr = proc.communicate()
+        proc = await runproc_async(self.subbed_command, env=self.env)
+        stdout, stderr = await proc.communicate()
         # HACK: This is quite cheesy: POSIX specifies that sh should return 127 for a missing command.
         # It's also possible that it'll be returned in other situations,
         # most likely when the last command in a shell script doesn't exist.
         # So we check if the command *we execute* exists, and complain then.
         status = proc.returncode
-        cmd = next((word for word in shlex.split(self.subbed_command) if not VARIABLE_OVERRIDE_RE.match(word)))
+        cmd = next(
+            (
+                word
+                for word in shlex.split(self.subbed_command)
+                if not VARIABLE_OVERRIDE_RE.match(word)
+            )
+        )
         if status == 127 and not find_command(cmd):
             raise CheckerError("Command could not be found: " + cmd)
         if status == 126 and not find_command(cmd):
@@ -522,6 +535,7 @@ class TestRun(object):
             # Process was killed by a signal and failed,
             # add a message.
             import signal
+
             # Unfortunately strsignal only exists in python 3.8+,
             # and signal.signals is 3.5+.
             if hasattr(signal, "Signals"):
@@ -624,6 +638,7 @@ class CheckCmd(object):
 class Checker(object):
     def __init__(self, name, lines):
         self.name = name
+
         # Helper to yield subline containing group1 from all matching lines.
         def group1s(regex):
             for line in lines:
@@ -655,8 +670,15 @@ class Checker(object):
         ]
 
 
-def check_file(input_file, name, subs, config, failure_handler):
-    """ Check a single file. Return a True on success, False on error. """
+def check_file(input_file, name, subs, config, failure_handler, env=None):
+    """Check a single file. Return a True on success, False on error."""
+    return asyncio.run(
+        check_file_async(input_file, name, subs, config, failure_handler, env=env)
+    )
+
+
+async def check_file_async(input_file, name, subs, config, failure_handler, env=None):
+    """Check a single file. Return a True on success, False on error."""
     success = True
     lines = Line.readfile(input_file, name)
     checker = Checker(name, lines)
@@ -664,10 +686,8 @@ def check_file(input_file, name, subs, config, failure_handler):
     # Run all the REQUIRES lines first,
     # if any of them fail it's a SKIP
     for reqcmd in checker.requirecmds:
-        proc = runproc(
-            perform_substitution(reqcmd.args, subs)
-        )
-        proc.communicate()
+        proc = await runproc_async(perform_substitution(reqcmd.args, subs), env=env)
+        await proc.communicate()
         if proc.returncode > 0:
             return SKIP
 
@@ -676,16 +696,22 @@ def check_file(input_file, name, subs, config, failure_handler):
 
     # Only then run the RUN lines.
     for runcmd in checker.runcmds:
-        failure = TestRun(name, runcmd, checker, subs, config).run()
+        failure = await TestRun(
+            name, runcmd, checker, subs, config, env=env
+        ).run_async()
         if failure:
             failure_handler(failure)
             success = False
     return success
 
 
-def check_path(path, subs, config, failure_handler):
+def check_path(path, subs, config, failure_handler, env=None):
+    return asyncio.run(check_path_async(path, subs, config, failure_handler, env=env))
+
+
+async def check_path_async(path, subs, config, failure_handler, env=None):
     with io.open(path, encoding="utf-8") as fd:
-        return check_file(fd, path, subs, config, failure_handler)
+        return await check_file_async(fd, path, subs, config, failure_handler, env=env)
 
 
 def parse_subs(subs):
@@ -710,7 +736,7 @@ def parse_subs(subs):
 
 
 def get_argparse():
-    """ Return a littlecheck argument parser. """
+    """Return a littlecheck argument parser."""
     parser = argparse.ArgumentParser(
         description="littlecheck: command line tool tester."
     )
